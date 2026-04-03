@@ -1,0 +1,9 @@
+{
+    "id": "graph-scaler",
+    "name": "Graph Scaler",
+    "version": "0.3.0",
+    "minAppVersion": "1.0.0",
+    "description": "Removes hard-coded limits from Obsidian — 12 uncappable features: node sizes, graph forces, idle frames, text fade, embed depth, sidebar width, zoom, tab size, canvas zoom, search limits, font range.",
+    "author": "blakethefn",
+    "isDesktopOnly": false
+}
