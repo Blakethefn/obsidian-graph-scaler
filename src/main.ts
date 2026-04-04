@@ -304,10 +304,9 @@ export default class UncapperPlugin extends Plugin {
                 dirty = true;
 
                 const plugin = this;
+                const original = renderer._uncapperOriginalSetScale;
                 renderer.setScale = function (this: any, e: number) {
-                    const t = this.powerTag;
-                    this.scale = e;
-                    this.nodeScale = Math.sqrt(1 / e);
+                    original.call(this, e);
 
                     if (plugin.settings.textFadeMode === "always") {
                         this.textAlpha = 1;
@@ -320,10 +319,6 @@ export default class UncapperPlugin extends Plugin {
                             0,
                             1
                         );
-                    }
-
-                    if (t) {
-                        t.scale.x = t.scale.y = e;
                     }
                 };
             }
