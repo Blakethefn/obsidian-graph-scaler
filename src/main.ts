@@ -57,6 +57,10 @@ interface UncapperSettings {
     // Canvas zoom breakpoint
     canvasZoomEnabled: boolean;
     canvasZoomBreakpoint: number;
+
+    // Adaptive link distance (node-size-aware)
+    adaptiveLinkDistanceEnabled: boolean;
+    adaptiveLinkDistancePadding: number;
 }
 
 const DEFAULT_SETTINGS: UncapperSettings = {
@@ -104,12 +108,17 @@ const DEFAULT_SETTINGS: UncapperSettings = {
 
     canvasZoomEnabled: false,
     canvasZoomBreakpoint: 0,
+
+    adaptiveLinkDistanceEnabled: false,
+    adaptiveLinkDistancePadding: 10,
 };
 
 export default class UncapperPlugin extends Plugin {
     settings: UncapperSettings = DEFAULT_SETTINGS;
     private searchPatched = false;
     private idleKickInterval: number | null = null;
+    private adaptiveLinkInterval: number | null = null;
+    private _adaptiveLinkDebounceTimer: number | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -132,12 +141,14 @@ export default class UncapperPlugin extends Plugin {
                 this.patchTabSize();
                 this.patchCanvasZoom();
                 this.startIdleKick();
+                this.startAdaptiveLinkInterval();
             }, 500);
         });
     }
 
     onunload() {
         this.stopIdleKick();
+        this.stopAdaptiveLinkInterval();
         this.restoreAllGraphViews();
         this.restoreFontSizeLimits();
         this.restoreEmbedDepth();
@@ -162,6 +173,7 @@ export default class UncapperPlugin extends Plugin {
         this.patchTabSize();
         this.patchCanvasZoom();
         this.startIdleKick();
+        this.startAdaptiveLinkInterval();
     }
 
     // ── Idle Frame Kick ───────────────────────────────────────
@@ -265,6 +277,8 @@ export default class UncapperPlugin extends Plugin {
                 delete renderer._uncapperOriginalSetScale;
             }
 
+            this.restoreAdaptiveLinkDistance(renderer);
+
             renderer.changed();
         }
     }
@@ -297,17 +311,22 @@ export default class UncapperPlugin extends Plugin {
             }
         }
 
-        // ── Patch text fade ──
-        if (this.settings.textFadeEnabled && typeof renderer.setScale === "function") {
+        // ── Patch setScale (text fade + adaptive link distance zoom) ──
+        const needsScalePatch = this.settings.textFadeEnabled
+            || (this.settings.adaptiveLinkDistanceEnabled && this.settings.nodeSizeEnabled);
+        if (needsScalePatch && typeof renderer.setScale === "function") {
             if (!renderer._uncapperOriginalSetScale) {
                 renderer._uncapperOriginalSetScale = renderer.setScale.bind(renderer);
                 dirty = true;
+            }
 
-                const plugin = this;
-                const original = renderer._uncapperOriginalSetScale;
-                renderer.setScale = function (this: any, e: number) {
-                    original.call(this, e);
+            const plugin = this;
+            const original = renderer._uncapperOriginalSetScale;
+            renderer.setScale = function (this: any, e: number) {
+                original.call(this, e);
 
+                // Text fade
+                if (plugin.settings.textFadeEnabled) {
                     if (plugin.settings.textFadeMode === "always") {
                         this.textAlpha = 1;
                     } else if (plugin.settings.textFadeMode === "never") {
@@ -320,8 +339,13 @@ export default class UncapperPlugin extends Plugin {
                             1
                         );
                     }
-                };
-            }
+                }
+
+                // Adaptive link distance: recalculate on zoom change
+                if (plugin.settings.adaptiveLinkDistanceEnabled && plugin.settings.nodeSizeEnabled) {
+                    plugin.debouncedAdaptiveLinkUpdate(this);
+                }
+            };
         }
 
         // Idle frames are handled by the kick interval, not per-leaf patching.
@@ -329,6 +353,13 @@ export default class UncapperPlugin extends Plugin {
         // ── Patch slider limits ──
         if (this.settings.linkDistanceEnabled || this.settings.forcesEnabled) {
             this.patchGraphOptions(view);
+        }
+
+        // ── Adaptive link distance (node-size-aware) ──
+        if (this.settings.adaptiveLinkDistanceEnabled && this.settings.nodeSizeEnabled) {
+            this.patchAdaptiveLinkDistance(renderer);
+        } else {
+            this.restoreAdaptiveLinkDistance(renderer);
         }
 
         if (dirty) {
@@ -369,6 +400,148 @@ export default class UncapperPlugin extends Plugin {
                     }
                 }
             }
+        }
+    }
+
+    // ── Adaptive Link Distance ──────────────────────────────────
+    // The graph simulation runs in a Web Worker and accepts a single
+    // global linkDistance via renderer.setForces({linkDistance: n}).
+    // We wrap setForces to enforce a minimum distance derived from
+    // the largest node sizes, and use a periodic interval to
+    // re-evaluate as node data changes over time.
+
+    private computeMinLinkDistance(renderer: any): number {
+        const nodes = renderer.nodes;
+        if (!nodes || nodes.length === 0) return 0;
+
+        let maxSize = 0;
+        for (const node of nodes) {
+            if (!node || typeof node.getSize !== "function") continue;
+            const size = node.getSize();
+            if (size > maxSize) maxSize = size;
+        }
+
+        // Obsidian renders nodes with nodeScale = √(1/scale), so
+        // visual node radius grows relative to distances as you
+        // zoom out.  To prevent overlap the simulation link distance
+        // must compensate by the same factor: 1/√(scale).
+        const scale = renderer.scale ?? 1;
+        const zoomFactor = scale > 0.01 ? 1 / Math.sqrt(scale) : 10;
+
+        return (2 * maxSize + this.settings.adaptiveLinkDistancePadding) * zoomFactor;
+    }
+
+    private debouncedAdaptiveLinkUpdate(renderer: any) {
+        if (this._adaptiveLinkDebounceTimer !== null) {
+            window.clearTimeout(this._adaptiveLinkDebounceTimer);
+        }
+        this._adaptiveLinkDebounceTimer = window.setTimeout(() => {
+            this._adaptiveLinkDebounceTimer = null;
+            if (!renderer._uncapperAdaptiveLinkPatched) return;
+
+            const minDist = this.computeMinLinkDistance(renderer);
+            const lastApplied = renderer._uncapperLastAppliedAdaptiveDist ?? 0;
+            const requested = renderer._uncapperLastRequestedLinkDistance ?? 250;
+            const effective = Math.max(requested, minDist);
+
+            // Only update if distance changed meaningfully
+            if (Math.abs(effective - lastApplied) > Math.max(5, lastApplied * 0.05)) {
+                renderer._uncapperOriginalSetForces({ linkDistance: effective });
+                renderer._uncapperLastAppliedAdaptiveDist = effective;
+            }
+        }, 300);
+    }
+
+    private patchAdaptiveLinkDistance(renderer: any) {
+        if (renderer._uncapperAdaptiveLinkPatched) return;
+        if (!renderer.setForces || typeof renderer.setForces !== "function") return;
+
+        renderer._uncapperOriginalSetForces = renderer.setForces.bind(renderer);
+        renderer._uncapperLastRequestedLinkDistance = 250;
+        renderer._uncapperLastAppliedAdaptiveDist = 0;
+
+        const plugin = this;
+        renderer.setForces = function (forces: any) {
+            // Track the user/system requested link distance
+            if (forces?.linkDistance !== undefined) {
+                renderer._uncapperLastRequestedLinkDistance = forces.linkDistance;
+            }
+
+            if (plugin.settings.adaptiveLinkDistanceEnabled && plugin.settings.nodeSizeEnabled) {
+                const minDist = plugin.computeMinLinkDistance(renderer);
+                const requested = forces?.linkDistance ?? renderer._uncapperLastRequestedLinkDistance ?? 250;
+                const effective = Math.max(requested, minDist);
+                if (effective !== requested) {
+                    forces = Object.assign({}, forces, { linkDistance: effective });
+                }
+                renderer._uncapperLastAppliedAdaptiveDist = forces.linkDistance ?? effective;
+            }
+
+            return renderer._uncapperOriginalSetForces(forces);
+        };
+
+        renderer._uncapperAdaptiveLinkPatched = true;
+
+        // Apply immediately with current node sizes
+        const minDist = this.computeMinLinkDistance(renderer);
+        const current = renderer._uncapperLastRequestedLinkDistance;
+        if (current < minDist) {
+            renderer._uncapperOriginalSetForces({ linkDistance: minDist });
+            renderer._uncapperLastAppliedAdaptiveDist = minDist;
+        }
+    }
+
+    private restoreAdaptiveLinkDistance(renderer: any) {
+        if (!renderer._uncapperAdaptiveLinkPatched) return;
+
+        if (renderer._uncapperOriginalSetForces) {
+            // Restore original distance before unwrapping
+            const orig = renderer._uncapperLastRequestedLinkDistance ?? 250;
+            renderer._uncapperOriginalSetForces({ linkDistance: orig });
+            renderer.setForces = renderer._uncapperOriginalSetForces;
+        }
+        delete renderer._uncapperAdaptiveLinkPatched;
+        delete renderer._uncapperOriginalSetForces;
+        delete renderer._uncapperLastRequestedLinkDistance;
+        delete renderer._uncapperLastAppliedAdaptiveDist;
+    }
+
+    private startAdaptiveLinkInterval() {
+        this.stopAdaptiveLinkInterval();
+        if (!this.settings.adaptiveLinkDistanceEnabled || !this.settings.nodeSizeEnabled) return;
+
+        // Periodically re-evaluate min distance as node data changes
+        this.adaptiveLinkInterval = window.setInterval(() => {
+            if (!this.settings.adaptiveLinkDistanceEnabled || !this.settings.nodeSizeEnabled) return;
+
+            const leaves = [
+                ...this.app.workspace.getLeavesOfType("graph"),
+                ...this.app.workspace.getLeavesOfType("localgraph"),
+            ];
+
+            for (const leaf of leaves) {
+                const renderer = (leaf.view as any)?.renderer;
+                if (!renderer?._uncapperAdaptiveLinkPatched) continue;
+
+                const minDist = this.computeMinLinkDistance(renderer);
+                const lastApplied = renderer._uncapperLastAppliedAdaptiveDist ?? 0;
+                const requested = renderer._uncapperLastRequestedLinkDistance ?? 250;
+                const effective = Math.max(requested, minDist);
+
+                // Only push an update if the distance actually changed
+                if (Math.abs(effective - lastApplied) > 1) {
+                    renderer._uncapperOriginalSetForces({ linkDistance: effective });
+                    renderer._uncapperLastAppliedAdaptiveDist = effective;
+                }
+            }
+        }, 3000);
+        this.registerInterval(this.adaptiveLinkInterval);
+    }
+
+    private stopAdaptiveLinkInterval() {
+        if (this.adaptiveLinkInterval !== null) {
+            window.clearInterval(this.adaptiveLinkInterval);
+            this.adaptiveLinkInterval = null;
         }
     }
 
@@ -935,6 +1108,38 @@ class UncapperSettingTab extends PluginSettingTab {
                 .addSlider((s) =>
                     s.setLimits(500, 5000, 100).setValue(this.plugin.settings.linkDistanceMax).setDynamicTooltip()
                         .onChange(async (v) => { this.plugin.settings.linkDistanceMax = v; await this.plugin.saveSettings(); })
+                );
+        }
+
+        // ── Adaptive Link Distance ──
+        this.renderSection(containerEl, "Adaptive Link Distance", "Scales each link's distance based on the connected nodes' sizes so large nodes never overlap. Requires Node Sizing to be enabled.");
+
+        new Setting(containerEl)
+            .setName("Enable adaptive link distance")
+            .setDesc("When enabled, a link's target distance is at least the sum of both node radii plus padding.")
+            .addToggle((t) =>
+                t.setValue(this.plugin.settings.adaptiveLinkDistanceEnabled).onChange(async (v) => {
+                    this.plugin.settings.adaptiveLinkDistanceEnabled = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                })
+            );
+
+        if (this.plugin.settings.adaptiveLinkDistanceEnabled) {
+            if (!this.plugin.settings.nodeSizeEnabled) {
+                const warn = containerEl.createEl("p", {
+                    text: "Node Sizing must be enabled for adaptive link distance to work.",
+                    cls: "setting-item-description",
+                });
+                warn.style.color = "var(--text-error)";
+            }
+
+            new Setting(containerEl)
+                .setName("Padding")
+                .setDesc("Extra distance beyond the two node radii (prevents nodes from touching edge-to-edge)")
+                .addSlider((s) =>
+                    s.setLimits(0, 100, 1).setValue(this.plugin.settings.adaptiveLinkDistancePadding).setDynamicTooltip()
+                        .onChange(async (v) => { this.plugin.settings.adaptiveLinkDistancePadding = v; await this.plugin.saveSettings(); })
                 );
         }
 
