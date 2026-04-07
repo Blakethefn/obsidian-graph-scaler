@@ -8,19 +8,29 @@ interface UncapperSettings {
     minSize: number;
     scalingMode: "linear" | "sqrt";
 
-    // Link distance
-    linkDistanceEnabled: boolean;
-    linkDistanceMax: number;
+    // Graph control (replaces native graph panel)
+    graphControlEnabled: boolean;
+
+    // Filters (when graph control enabled)
+    filterSearch: string;
+    filterShowTags: boolean;
+    filterShowAttachments: boolean;
+    filterShowOrphans: boolean;
+
+    // Forces (direct values, when graph control enabled)
+    centerForce: number;
+    repelForce: number;
+    linkForce: number;
+    linkDistanceValue: number;
+
+    // Display (when graph control enabled)
+    showArrows: boolean;
+    lineSizeMultiplier: number;
 
     // Text fade
     textFadeEnabled: boolean;
     textFadeMode: "always" | "never" | "custom";
     textFadeCustom: number;
-
-    // Graph forces
-    forcesEnabled: boolean;
-    repelStrengthMax: number;
-    centerStrengthMax: number;
 
     // Graph idle frames
     idleFramesEnabled: boolean;
@@ -70,16 +80,24 @@ const DEFAULT_SETTINGS: UncapperSettings = {
     minSize: 4,
     scalingMode: "sqrt",
 
-    linkDistanceEnabled: false,
-    linkDistanceMax: 2000,
+    graphControlEnabled: false,
+
+    filterSearch: "",
+    filterShowTags: false,
+    filterShowAttachments: false,
+    filterShowOrphans: false,
+
+    centerForce: 0.5,
+    repelForce: 10,
+    linkForce: 1,
+    linkDistanceValue: 250,
+
+    showArrows: false,
+    lineSizeMultiplier: 1,
 
     textFadeEnabled: false,
     textFadeMode: "custom",
     textFadeCustom: -5,
-
-    forcesEnabled: false,
-    repelStrengthMax: 100,
-    centerStrengthMax: 5,
 
     idleFramesEnabled: false,
     idleFramesMode: "unlimited",
@@ -262,6 +280,14 @@ export default class UncapperPlugin extends Plugin {
         for (const leaf of leaves) {
             const view = leaf.view as any;
             const renderer = view?.renderer;
+
+            // Restore hidden native controls
+            if (view?.controlsEl?._uncapperHidden) {
+                view.controlsEl.style.display = view.controlsEl._uncapperOriginalDisplay ?? "";
+                delete view.controlsEl._uncapperHidden;
+                delete view.controlsEl._uncapperOriginalDisplay;
+            }
+
             if (!renderer?.nodes) continue;
 
             for (const node of renderer.nodes) {
@@ -291,6 +317,74 @@ export default class UncapperPlugin extends Plugin {
         if (!renderer) return;
 
         let dirty = false;
+
+        // ── Hide native controls and apply direct values ──
+        if (this.settings.graphControlEnabled) {
+            // Hide the native graph controls panel
+            if (view.controlsEl && !view.controlsEl._uncapperHidden) {
+                view.controlsEl._uncapperOriginalDisplay = view.controlsEl.style.display;
+                view.controlsEl.style.display = "none";
+                view.controlsEl._uncapperHidden = true;
+            }
+
+            // Apply forces directly to the renderer
+            if (typeof renderer.setForces === "function" || renderer._uncapperOriginalSetForces) {
+                const setForcesFn = renderer._uncapperOriginalSetForces || renderer.setForces.bind(renderer);
+                setForcesFn({
+                    centerStrength: this.settings.centerForce,
+                    repelStrength: this.settings.repelForce,
+                    linkStrength: this.settings.linkForce,
+                    linkDistance: this.settings.linkDistanceValue,
+                });
+                dirty = true;
+            }
+
+            // Apply display options
+            if (renderer.fShowArrow !== undefined) {
+                renderer.fShowArrow = this.settings.showArrows;
+            }
+            if (renderer.fLineSizeMult !== undefined) {
+                renderer.fLineSizeMult = this.settings.lineSizeMultiplier;
+            }
+
+            // Apply filters to the data engine
+            if (view.dataEngine) {
+                const engine = view.dataEngine;
+                // Try common property patterns for filter options
+                if (engine.searchQueries !== undefined) {
+                    engine.searchQueries = this.settings.filterSearch
+                        ? this.settings.filterSearch.split("\n").filter((s: string) => s.trim())
+                        : [];
+                } else if (engine.query !== undefined) {
+                    engine.query = this.settings.filterSearch || "";
+                }
+                if (engine.showTags !== undefined) engine.showTags = this.settings.filterShowTags;
+                if (engine.showAttachments !== undefined) engine.showAttachments = this.settings.filterShowAttachments;
+                if (engine.showOrphans !== undefined) engine.showOrphans = this.settings.filterShowOrphans;
+
+                // Also try options object pattern
+                if (engine.options) {
+                    if (engine.options.search !== undefined) {
+                        engine.options.search = this.settings.filterSearch || "";
+                    }
+                    if (engine.options.showTags !== undefined) engine.options.showTags = this.settings.filterShowTags;
+                    if (engine.options.showAttachments !== undefined) engine.options.showAttachments = this.settings.filterShowAttachments;
+                    if (engine.options.showOrphans !== undefined) engine.options.showOrphans = this.settings.filterShowOrphans;
+                }
+
+                // Trigger filter re-evaluation
+                if (typeof engine.render === "function") {
+                    engine.render();
+                }
+            }
+        } else {
+            // Restore native controls if they were hidden
+            if (view.controlsEl?._uncapperHidden) {
+                view.controlsEl.style.display = view.controlsEl._uncapperOriginalDisplay ?? "";
+                delete view.controlsEl._uncapperHidden;
+                delete view.controlsEl._uncapperOriginalDisplay;
+            }
+        }
 
         // ── Patch node sizes ──
         if (this.settings.nodeSizeEnabled && renderer.nodes) {
@@ -350,11 +444,6 @@ export default class UncapperPlugin extends Plugin {
 
         // Idle frames are handled by the kick interval, not per-leaf patching.
 
-        // ── Patch slider limits ──
-        if (this.settings.linkDistanceEnabled || this.settings.forcesEnabled) {
-            this.patchGraphOptions(view);
-        }
-
         // ── Adaptive link distance (node-size-aware) ──
         if (this.settings.adaptiveLinkDistanceEnabled && this.settings.nodeSizeEnabled) {
             this.patchAdaptiveLinkDistance(renderer);
@@ -364,42 +453,6 @@ export default class UncapperPlugin extends Plugin {
 
         if (dirty) {
             renderer.changed();
-        }
-    }
-
-    private patchGraphOptions(view: any) {
-        if (!view.dataEngine) return;
-        const controlsEl = view.controlsEl as HTMLElement | undefined;
-        if (!controlsEl) return;
-
-        const settings = controlsEl.querySelectorAll(".setting-item");
-        for (const settingEl of Array.from(settings)) {
-            const nameEl = settingEl.querySelector(".setting-item-name");
-            const slider = settingEl.querySelector(
-                'input[type="range"]'
-            ) as HTMLInputElement | null;
-            if (!nameEl || !slider) continue;
-
-            const name = nameEl.textContent?.toLowerCase() || "";
-
-            if (this.settings.linkDistanceEnabled && name.includes("distance")) {
-                if (parseFloat(slider.max) < this.settings.linkDistanceMax) {
-                    slider.max = String(this.settings.linkDistanceMax);
-                }
-            }
-
-            if (this.settings.forcesEnabled) {
-                if (name.includes("repel")) {
-                    if (parseFloat(slider.max) < this.settings.repelStrengthMax) {
-                        slider.max = String(this.settings.repelStrengthMax);
-                    }
-                }
-                if (name.includes("center")) {
-                    if (parseFloat(slider.max) < this.settings.centerStrengthMax) {
-                        slider.max = String(this.settings.centerStrengthMax);
-                    }
-                }
-            }
         }
     }
 
@@ -1088,26 +1141,114 @@ class UncapperSettingTab extends PluginSettingTab {
             }
         }
 
-        // ── Link Distance ──
-        this.renderSection(containerEl, "Link Distance", "Extends the link distance slider beyond the default 30-500 cap.");
+        // ── Graph Control ──
+        this.renderSection(containerEl, "Graph Control", "Replaces the native graph controls entirely. When enabled, the built-in graph filter/force/display panel is hidden and all graph behavior is controlled here.");
 
         new Setting(containerEl)
-            .setName("Enable link distance uncapping")
+            .setName("Replace native graph controls")
+            .setDesc("Hides the built-in graph panel. Forces, filters, and display are set directly from these settings.")
             .addToggle((t) =>
-                t.setValue(this.plugin.settings.linkDistanceEnabled).onChange(async (v) => {
-                    this.plugin.settings.linkDistanceEnabled = v;
+                t.setValue(this.plugin.settings.graphControlEnabled).onChange(async (v) => {
+                    this.plugin.settings.graphControlEnabled = v;
                     await this.plugin.saveSettings();
                     this.display();
                 })
             );
 
-        if (this.plugin.settings.linkDistanceEnabled) {
+        if (this.plugin.settings.graphControlEnabled) {
+            // ── Filters sub-section ──
+            containerEl.createEl("h4", { text: "Filters" });
+
             new Setting(containerEl)
-                .setName("Max link distance")
-                .setDesc("Default cap is 500")
+                .setName("Search filter")
+                .setDesc("Filter nodes by search query (same as the graph search box)")
+                .addText((t) =>
+                    t.setPlaceholder("e.g. path:folder OR tag:#tag")
+                        .setValue(this.plugin.settings.filterSearch)
+                        .onChange(async (v) => { this.plugin.settings.filterSearch = v; await this.plugin.saveSettings(); })
+                );
+
+            new Setting(containerEl)
+                .setName("Show tags")
+                .addToggle((t) =>
+                    t.setValue(this.plugin.settings.filterShowTags).onChange(async (v) => {
+                        this.plugin.settings.filterShowTags = v;
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName("Show attachments")
+                .addToggle((t) =>
+                    t.setValue(this.plugin.settings.filterShowAttachments).onChange(async (v) => {
+                        this.plugin.settings.filterShowAttachments = v;
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName("Show orphans")
+                .addToggle((t) =>
+                    t.setValue(this.plugin.settings.filterShowOrphans).onChange(async (v) => {
+                        this.plugin.settings.filterShowOrphans = v;
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            // ── Forces sub-section ──
+            containerEl.createEl("h4", { text: "Forces" });
+
+            new Setting(containerEl)
+                .setName("Center force")
+                .setDesc("How strongly nodes are pulled toward the center. Default: 0.5")
                 .addSlider((s) =>
-                    s.setLimits(500, 5000, 100).setValue(this.plugin.settings.linkDistanceMax).setDynamicTooltip()
-                        .onChange(async (v) => { this.plugin.settings.linkDistanceMax = v; await this.plugin.saveSettings(); })
+                    s.setLimits(0, 5, 0.01).setValue(this.plugin.settings.centerForce).setDynamicTooltip()
+                        .onChange(async (v) => { this.plugin.settings.centerForce = v; await this.plugin.saveSettings(); })
+                );
+
+            new Setting(containerEl)
+                .setName("Repel force")
+                .setDesc("How strongly nodes push each other apart. Default: 10")
+                .addSlider((s) =>
+                    s.setLimits(0, 200, 1).setValue(this.plugin.settings.repelForce).setDynamicTooltip()
+                        .onChange(async (v) => { this.plugin.settings.repelForce = v; await this.plugin.saveSettings(); })
+                );
+
+            new Setting(containerEl)
+                .setName("Link force")
+                .setDesc("How strongly links pull connected nodes together. Default: 1")
+                .addSlider((s) =>
+                    s.setLimits(0, 5, 0.01).setValue(this.plugin.settings.linkForce).setDynamicTooltip()
+                        .onChange(async (v) => { this.plugin.settings.linkForce = v; await this.plugin.saveSettings(); })
+                );
+
+            new Setting(containerEl)
+                .setName("Link distance")
+                .setDesc("Target distance between linked nodes. Default: 250")
+                .addSlider((s) =>
+                    s.setLimits(10, 5000, 10).setValue(this.plugin.settings.linkDistanceValue).setDynamicTooltip()
+                        .onChange(async (v) => { this.plugin.settings.linkDistanceValue = v; await this.plugin.saveSettings(); })
+                );
+
+            // ── Display sub-section ──
+            containerEl.createEl("h4", { text: "Display" });
+
+            new Setting(containerEl)
+                .setName("Show arrows")
+                .setDesc("Show directional arrows on links")
+                .addToggle((t) =>
+                    t.setValue(this.plugin.settings.showArrows).onChange(async (v) => {
+                        this.plugin.settings.showArrows = v;
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName("Line thickness")
+                .setDesc("Multiplier for link line thickness. Default: 1")
+                .addSlider((s) =>
+                    s.setLimits(0.1, 5, 0.1).setValue(this.plugin.settings.lineSizeMultiplier).setDynamicTooltip()
+                        .onChange(async (v) => { this.plugin.settings.lineSizeMultiplier = v; await this.plugin.saveSettings(); })
                 );
         }
 
@@ -1140,37 +1281,6 @@ class UncapperSettingTab extends PluginSettingTab {
                 .addSlider((s) =>
                     s.setLimits(0, 100, 1).setValue(this.plugin.settings.adaptiveLinkDistancePadding).setDynamicTooltip()
                         .onChange(async (v) => { this.plugin.settings.adaptiveLinkDistancePadding = v; await this.plugin.saveSettings(); })
-                );
-        }
-
-        // ── Graph Forces ──
-        this.renderSection(containerEl, "Graph Forces", "Extends repel and center strength sliders for large vaults.");
-
-        new Setting(containerEl)
-            .setName("Enable force uncapping")
-            .addToggle((t) =>
-                t.setValue(this.plugin.settings.forcesEnabled).onChange(async (v) => {
-                    this.plugin.settings.forcesEnabled = v;
-                    await this.plugin.saveSettings();
-                    this.display();
-                })
-            );
-
-        if (this.plugin.settings.forcesEnabled) {
-            new Setting(containerEl)
-                .setName("Max repel strength")
-                .setDesc("Default cap is 20 (cubed internally)")
-                .addSlider((s) =>
-                    s.setLimits(20, 200, 1).setValue(this.plugin.settings.repelStrengthMax).setDynamicTooltip()
-                        .onChange(async (v) => { this.plugin.settings.repelStrengthMax = v; await this.plugin.saveSettings(); })
-                );
-
-            new Setting(containerEl)
-                .setName("Max center strength")
-                .setDesc("Default cap is 1")
-                .addSlider((s) =>
-                    s.setLimits(1, 20, 0.1).setValue(this.plugin.settings.centerStrengthMax).setDynamicTooltip()
-                        .onChange(async (v) => { this.plugin.settings.centerStrengthMax = v; await this.plugin.saveSettings(); })
                 );
         }
 
